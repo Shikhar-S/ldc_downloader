@@ -10,6 +10,25 @@
 #                                                                              #
 # Change log:                                                                  #
 #                                                                              #
+#  * 2026-08-14                                                                #
+#    Run without a terminal, so the script can be driven by automation.        #
+#      - Read LDC_EMAIL / LDC_PASSWORD / LDC_DOWNLOAD_DIR from the environment #
+#        or from ldc.env (beside this script) or ~/.ldc.env. Still prompts     #
+#        when stdin is a terminal and nothing was configured.                  #
+#      - Exit instead of silently posting empty credentials when there is no   #
+#        terminal to prompt on, and check that login actually succeeded.       #
+#      - Reuse the session in cookies.txt rather than logging in every run.    #
+#      - Download every part of a multi-part corpus. A corpus is all catalog   #
+#        rows whose ID matches exactly, deduplicated by (filename, MD5);       #
+#        previously a multi-row corpus produced a malformed URL.               #
+#      - Keep each file's real extension instead of assuming .tgz.             #
+#      - Verify by MD5, or by exact byte count when the catalog still lists    #
+#        the checksum as "calculating".                                        #
+#      - Write to <name>.part and rename only after verifying, resume          #
+#        interrupted transfers, and skip files that are already correct.       #
+#      - Keep the password out of ps by passing it to curl from a file.        #
+#      - Fix the timestamp format (%M is minutes; the month is %m).            #
+#                                                                              #
 #  * 2016-03-05 Lane Schwartz                                                  #
 #    Verify that downloaded files are tgz, not HTML.                           #
 #    If HTML, exit the script, because file was not correctly downloaded       #
@@ -37,192 +56,409 @@
 #                                                                              #
 ################################################################################
 
+# Not "set -e": the HTML parse pipeline and the catalog lookups return non-zero
+# in normal operation and are checked explicitly instead.
+set -uo pipefail
 
+umask 077
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-
-################################################################################
-#                                                                              #
-#                        Bash functions and variables                          #
-#                                                                              #
-################################################################################
-
-# Define a bash function for logging messages with a timestamp
-log() {
-    TIMESTAMP=$(date +"%Y-%M-%d %H:%M:%S UTC%:::z")
-    printf "%-27s %-65s %-3s" "${TIMESTAMP}" "$1" "..."  1>&2 ;
-}
-
-# Define required URL variables
 BASE_URL="https://catalog.ldc.upenn.edu"
 LOGIN_URL="https://catalog.ldc.upenn.edu/login"
 DOWNLOADS_URL="https://catalog.ldc.upenn.edu/organization/downloads"
 
-# Define other variables
-COOKIES_FILE="cookies.txt"
-COOKIE_FLAGS="-b ${COOKIES_FILE} -c ${COOKIES_FILE}"
-DOWNLOAD_FILE="corpora.tsv"
+# Exit codes: 1 config/usage, 2 auth, 3 unknown corpus, 4 disk, 5 download
+EXIT_CONFIG=1
+EXIT_AUTH=2
+EXIT_NOTFOUND=3
+EXIT_DISK=4
+EXIT_DOWNLOAD=5
 
+log() { printf '[%s] %s\n' "$(date +'%Y-%m-%d %H:%M:%S %Z')" "$*" 1>&2 ; }
+die() { local s="$1"; shift; printf 'ERROR: %s\n' "$*" 1>&2 ; exit "$s" ; }
+gb()  { awk -v k="$1" 'BEGIN { printf "%.2f GB", k/1048576 }' ; }
+
+TMPFILES=()
+cleanup() { [[ ${#TMPFILES[@]} -gt 0 ]] && rm -f "${TMPFILES[@]}" ; return 0 ; }
+trap cleanup EXIT
+
+mktempfile() { local f; f=$(mktemp) || return 1; TMPFILES+=("$f"); printf '%s' "$f"; }
+
+usage() {
+    cat <<EOF
+Download corpora from the Linguistic Data Consortium.
+
+Usage:  $(basename "$0") LDC_CORPUS_ID [LDC_CORPUS_ID ...]
+
+With no arguments, refreshes the list of corpora available to your account into
+corpora.tsv and downloads nothing.
+
+Configuration comes from the environment, else ./ldc.env, else ~/.ldc.env:
+
+  LDC_EMAIL          Your LDC account email address
+  LDC_PASSWORD       Your LDC account password
+  LDC_DOWNLOAD_DIR   Where to write files (default: current directory).
+                     cookies.txt and corpora.tsv are kept here too.
+
+Environment variables win over the env file. Multi-part corpora are downloaded
+in full. Re-running is safe: files already present and verified are skipped.
+
+Exit codes: 0 ok, 1 config, 2 auth, 3 unknown corpus, 4 disk, 5 download.
+EOF
+}
 
 
 ################################################################################
-#                                                                              #
-#                    Prompt user for LDC login credentials                     #
-#                                                                              #
+#                              Configuration                                   #
 ################################################################################
 
-if [[ ! -f "${COOKIES_FILE}" ]]; then
+LDC_EMAIL="${LDC_EMAIL:-}"
+LDC_PASSWORD="${LDC_PASSWORD:-}"
+LDC_DOWNLOAD_DIR="${LDC_DOWNLOAD_DIR:-}"
+ENV_FILE_USED=""
 
-    log "Enter LDC login credentials"
-    echo
-    echo
+# Load an env file without letting it override the real environment.
+load_env_file() {
+    local file="$1"
+    [[ -f "$file" && -r "$file" ]] || return 1
 
-    # Prompt user for login information
-    read -p "Enter email address: " EMAIL
-    read -s -p "Enter Password: "   PASSWORD
-    echo
-    echo
+    local e="$LDC_EMAIL" p="$LDC_PASSWORD" d="$LDC_DOWNLOAD_DIR"
+    set -a
+    # shellcheck disable=SC1090
+    . "$file"
+    set +a
+    [[ -n "$e" ]] && LDC_EMAIL="$e"
+    [[ -n "$p" ]] && LDC_PASSWORD="$p"
+    [[ -n "$d" ]] && LDC_DOWNLOAD_DIR="$d"
 
+    ENV_FILE_USED="$file"
+    return 0
+}
+
+load_env_file "${SCRIPT_DIR}/ldc.env" || load_env_file "${HOME}/.ldc.env" || true
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
 fi
 
+[[ -n "$LDC_DOWNLOAD_DIR" ]] || LDC_DOWNLOAD_DIR="$PWD"
+mkdir -p "$LDC_DOWNLOAD_DIR" \
+    || die "$EXIT_CONFIG" "Cannot create download directory: ${LDC_DOWNLOAD_DIR}"
+LDC_DOWNLOAD_DIR=$(cd -- "$LDC_DOWNLOAD_DIR" && pwd)
 
-################################################################################
-#                                                                              #
-#                         Get LDC authenticity token                           #
-#                                                                              #
-################################################################################
-
-log "Accessing LDC login page"
-echo
-
-# Extract authenticity token from LDC login page
-TOKEN=$(curl ${COOKIE_FLAGS} "${LOGIN_URL}" 2> /dev/null | grep -oh '"authenticity_token"\s*value="[^"]*')
-TOKEN=${TOKEN:28}
+COOKIES_FILE="${LDC_DOWNLOAD_DIR}/cookies.txt"
+CATALOG_FILE="${LDC_DOWNLOAD_DIR}/corpora.tsv"
 
 
 ################################################################################
-#                                                                              #
-#                            Log in to LDC account                             #
-#                                                                              #
+#                          Log in and fetch the catalog                        #
 ################################################################################
 
-log "Logging in to your LDC account"
+# Under automation stdin is not a terminal, and read would return immediately.
+# That is how empty credentials used to reach the login form.
+prompt_for_credentials() {
+    [[ -t 0 ]] || die "$EXIT_CONFIG" \
+"No LDC credentials available and stdin is not a terminal.
 
-curl ${COOKIE_FLAGS}                                    \
-    --data-urlencode "utf8=✓"                           \
-    --data-urlencode "authenticity_token=${TOKEN}"      \
-    --data-urlencode "spree_user[login]=${EMAIL}"       \
-    --data-urlencode "spree_user[password]=${PASSWORD}" \
-    --data-urlencode "spree_user[remember_me]=1"        \
-    --data-urlencode "commit=Login"                     \
-    "${LOGIN_URL}" &> /dev/null
+Set LDC_EMAIL and LDC_PASSWORD in the environment, or:
 
-echo
+    cp ${SCRIPT_DIR}/ldc.env.example ${SCRIPT_DIR}/ldc.env
+    \$EDITOR ${SCRIPT_DIR}/ldc.env
+    chmod 600 ${SCRIPT_DIR}/ldc.env"
 
+    [[ -n "$LDC_EMAIL"    ]] || read -r    -p "Enter email address: " LDC_EMAIL
+    [[ -n "$LDC_PASSWORD" ]] || { read -r -s -p "Enter Password: " LDC_PASSWORD; echo 1>&2; }
 
+    [[ -n "$LDC_EMAIL" && -n "$LDC_PASSWORD" ]] \
+        || die "$EXIT_CONFIG" "Email address and password are both required."
+}
+
+# Turn the downloads page into a tab separated table. Column layout:
+#   1 corpus ID   2 title   3 date   4 download count   5 URL   6 file cell
+parse_downloads_html() {
+    grep -v "^\s*$" < "$1"                                  | \
+        sed 's,\s\s*, ,g'                                   | \
+        sed 's,> <,><,g'                                    | \
+        sed 's,^ ,,'                                        | \
+        sed 's,><,>\n<,g'                                   | \
+        tr -d '\n'                                          | \
+        sed 's,.*<tbody>\(.*\)</tbody>.*,\1,'               | \
+        sed 's,<tr,\n<tr,g'                                 | \
+        sed 's,<tr[^>]*>,,g'                                | \
+        sed 's,<td[^>]*>,,g'                                | \
+        sed 's,<span[^>]*>,,g'                              | \
+        sed "s,<a [^>]* href='\([^']*\)'[^>]*>,\1,g"        | \
+        sed 's,</[^>]*>,\t,g'                               | \
+        sed 's,\t\t*,\t,g'
+}
+
+# Non-zero means we are not (or no longer) logged in. A login redirect page must
+# never be mistaken for a catalog.
+fetch_catalog() {
+    local html tmp code
+    html=$(mktempfile) || return 1
+    tmp=$(mktempfile)  || return 1
+
+    code=$(curl -sS -b "$COOKIES_FILE" -c "$COOKIES_FILE" \
+                -o "$html" -w '%{http_code}' "$DOWNLOADS_URL" 2>/dev/null) || return 1
+    [[ "$code" == "200" ]] || return 1
+    grep -q '<tbody>' "$html" || return 1
+
+    parse_downloads_html "$html" > "$tmp"
+    grep -qi '<html' "$tmp" && return 1
+    awk -F'\t' '$1 ~ /^LDC[0-9]/ { ok = 1; exit } END { exit !ok }' "$tmp" || return 1
+
+    cat "$tmp" > "$CATALOG_FILE"
+}
+
+login() {
+    [[ -n "$LDC_EMAIL" && -n "$LDC_PASSWORD" ]] || prompt_for_credentials
+
+    log "Accessing LDC login page"
+    rm -f "$COOKIES_FILE"   # a stale jar must not mask a failed login
+
+    local token
+    token=$(curl -sS -b "$COOKIES_FILE" -c "$COOKIES_FILE" "$LOGIN_URL" 2>/dev/null \
+            | grep -oh '"authenticity_token"\s*value="[^"]*')
+    token=${token:28}
+    [[ -n "$token" ]] || die "$EXIT_AUTH" "No authenticity token at ${LOGIN_URL}."
+
+    log "Logging in to your LDC account"
+
+    # Command line arguments are visible to every user on the machine via ps.
+    local pwfile tokfile
+    pwfile=$(mktempfile)  || die "$EXIT_AUTH" "Could not create a temporary file."
+    tokfile=$(mktempfile) || die "$EXIT_AUTH" "Could not create a temporary file."
+    printf '%s' "$LDC_PASSWORD" > "$pwfile"
+    printf '%s' "$token"        > "$tokfile"
+
+    curl -sS -b "$COOKIES_FILE" -c "$COOKIES_FILE"          \
+        --data-urlencode "utf8=✓"                           \
+        --data-urlencode "authenticity_token@${tokfile}"    \
+        --data-urlencode "spree_user[login]=${LDC_EMAIL}"   \
+        --data-urlencode "spree_user[password]@${pwfile}"   \
+        --data-urlencode "spree_user[remember_me]=1"        \
+        --data-urlencode "commit=Login"                     \
+        -o /dev/null "${LOGIN_URL}" 2>/dev/null
+
+    rm -f "$pwfile" "$tokfile"
+
+    # remember_spree_user_token is only issued once authentication succeeds.
+    grep -q 'remember_spree_user_token' "$COOKIES_FILE" 2>/dev/null \
+        || die "$EXIT_AUTH" "Login failed. Check LDC_EMAIL and LDC_PASSWORD."
+}
+
+ensure_catalog() {
+    if [[ -f "$COOKIES_FILE" ]] && fetch_catalog; then
+        log "Reused the existing LDC session"
+        return 0
+    fi
+    login
+    log "Accessing list of your LDC corpora"
+    fetch_catalog || die "$EXIT_AUTH" "Logged in, but could not read the corpora list."
+}
 
 
 ################################################################################
-#                                                                              #
-#                         Access list of LDC corpora                           #
-#                                                                              #
+#                          Catalog lookup and download                         #
 ################################################################################
 
-log "Accessing list of your LDC corpora"
+# One line per distinct file in a corpus:  url \t filename \t md5 \t size_kib
+# A corpus is every row matching the ID, deduplicated by (filename, MD5) since
+# the same file can be granted to an account more than once.
+resolve_parts() {
+    awk -F'\t' -v id="$1" '
+        $1 == id {
+            cell = $6
 
+            fname = cell
+            sub(/<br\/>.*/, "", fname)
+            gsub(/^ +| +$/, "", fname)
+            gsub(/ /, "_", fname)
 
-curl ${COOKIE_FLAGS} "${DOWNLOADS_URL}"     2> /dev/null    | \
-    grep -v "^\s*$"                                         | \
-    sed 's,\s\s*, ,g'                                       | \
-    sed 's,> <,><,g'                                        | \
-    sed 's,^ ,,'                                            | \
-    sed 's,><,>\n<,g'                                       | \
-    tr -d '\n'                                              | \
-    sed 's,.*<tbody>\(.*\)</tbody>.*,\1,'                   | \
-    sed 's,<tr,\n<tr,g'                                     | \
-    sed 's,<tr[^>]*>,,g'                                    | \
-    sed 's,<td[^>]*>,,g'                                    | \
-    sed 's,<span[^>]*>,,g'                                  | \
-    sed "s,<a [^>]* href='\([^']*\)'[^>]*>,\1,g"            | \
-    sed 's,</[^>]*>,\t,g'                                   | \
-    sed 's,\t\t*,\t,g'                                        \
-    > ${DOWNLOAD_FILE}                                        \
-    2> /dev/null
+            md5 = ""
+            if (match(cell, /MD5 Checksum: [0-9a-f][0-9a-f]*/)) {
+                c = substr(cell, RSTART + 14, RLENGTH - 14)
+                if (length(c) == 32) md5 = c
+            }
 
-# Add a trailing newline to the download file
-echo >> ${DOWNLOAD_FILE}
+            kib = 0
+            if (match(cell, /File Size: [0-9.]+ ?[KMGT]?B/)) {
+                s = substr(cell, RSTART + 11, RLENGTH - 11)
+                n = s + 0
+                if      (s ~ /TB/) n *= 1073741824
+                else if (s ~ /GB/) n *= 1048576
+                else if (s ~ /MB/) n *= 1024
+                else if (s ~ /KB/) n *= 1
+                else               n /= 1024
+                kib = int(n)
+            }
 
-echo
+            key = fname SUBSEP md5
+            if (!(key in seen)) {
+                seen[key] = 1
+                # "-", not empty: tab is IFS whitespace, so bash read would
+                # collapse an empty column and shift every field after it.
+                print $5 "\t" fname "\t" (md5 == "" ? "-" : md5) "\t" kib
+            }
+        }
+    ' "$CATALOG_FILE"
+}
 
+corpus_title() {
+    awk -F'\t' -v id="$1" '$1 == id { gsub(/ /, "_", $2); print $2; exit }' "$CATALOG_FILE"
+}
 
+# The extension is unknown until the server tells us, so match the bare base name
+# or any one extension.
+already_have() {
+    local base="$1" md5="$2" f
+    for f in "${LDC_DOWNLOAD_DIR}/${base}" "${LDC_DOWNLOAD_DIR}/${base}".*; do
+        [[ -f "$f" && "$f" != *.part && "$f" != *.headers ]] || continue
+        if [[ -n "$md5" && "$(md5sum "$f" | cut -d ' ' -f 1)" != "$md5" ]]; then
+            continue
+        fi
+        printf '%s' "$f"
+        return 0
+    done
+    return 1
+}
 
-################################################################################
-#                                                                              #
-#                       Provide user with status update                        #
-#                                                                              #
-################################################################################
+download_part() {
+    local base="$1" url="$2" fname="$3" md5="$4"
+    local partfile="${LDC_DOWNLOAD_DIR}/${base}.part"
+    local hdrfile="${LDC_DOWNLOAD_DIR}/${base}.headers"
 
-echo
-echo "A list of the LDC corpora associated with your account has been saved to ${DOWNLOAD_FILE}"
-echo
+    [[ "$url" =~ ^http ]] || url="${BASE_URL}${url}"
+    log "Downloading ${fname}"
 
-if [[ "$*" == "" ]]; then
+    if ! curl -L -C - --retry 5 --retry-delay 10 --fail --no-progress-meter \
+              -b "$COOKIES_FILE" -c "$COOKIES_FILE"                        \
+              -D "$hdrfile" -o "$partfile" "$url"; then
+        printf 'ERROR: transfer failed for %s (partial data kept at %s)\n' \
+               "$fname" "$partfile" 1>&2
+        return 1
+    fi
 
-    echo "To download any of these corpora, re-run this script, providing the LDC corpus IDs as command line arguments"
-    echo
+    # A saved HTML page means the session expired or the URL is not a file.
+    if [[ "$(file -i -b "$partfile" 2>/dev/null | cut -d ';' -f 1)" == "text/html" ]]; then
+        rm -f "$partfile"
+        printf 'ERROR: %s came back as HTML, not a data file.\n' "$fname" 1>&2
+        return 1
+    fi
 
-fi
+    local actual expected final="$base"
+    actual=$(stat -c '%s' "$partfile")
 
-
-
-################################################################################
-#                                                                              #
-#                            Download LDC corpora                              #
-#                                                                              #
-################################################################################
-
-for LDC_CORPUS in "$@" ; do
-
-    echo
-
-    TSV_LINE=$(grep "${LDC_CORPUS}" ${DOWNLOAD_FILE})
-    CORPUS_URL=$(cut  -f 5 <<< "${TSV_LINE}")
-    CORPUS_NAME=$(cut -f 2 <<< "${TSV_LINE}" | tr ' ' '_')
-    CORPUS_FILE=$(cut -f 6 <<< "${TSV_LINE}" | sed 's,<br/>.*,,; s,.tgz$,,')
-
-    LDC_CORPUS_FILENAME="${LDC_CORPUS}__${CORPUS_NAME}__${CORPUS_FILE}.tgz"
-    LDC_CORPUS_LOGNAME="${LDC_CORPUS}__${CORPUS_NAME}__${CORPUS_FILE}.log"
-
-    if   [[ "${CORPUS_URL}" =~ ^/download ]]; then
-
-        log "Downloading ${LDC_CORPUS} from ${BASE_URL}${CORPUS_URL} to \"${LDC_CORPUS_FILENAME}\""
-        echo
-        curl ${COOKIE_FLAGS} "${BASE_URL}${CORPUS_URL}" > "${LDC_CORPUS_FILENAME}" 2> "${LDC_CORPUS_LOGNAME}"
-
-    elif [[ "${CORPUS_URL}" =~ ^http ]]; then
-
-        log "Downloading ${LDC_CORPUS} from ${CORPUS_URL}"
-        echo
-        curl ${COOKIE_FLAGS} "${CORPUS_URL}" > "${LDC_CORPUS_FILENAME}" 2> "${LDC_CORPUS_LOGNAME}"
-
+    if [[ -n "$md5" ]]; then
+        local got
+        got=$(md5sum "$partfile" | cut -d ' ' -f 1)
+        if [[ "$got" != "$md5" ]]; then
+            printf 'ERROR: MD5 mismatch for %s (expected %s, got %s)\n' \
+                   "$fname" "$md5" "$got" 1>&2
+            return 1
+        fi
     else
-
-        log "Not downloading ${LDC_CORPUS}: ${CORPUS_URL}"
-        echo
-
+        # Some catalog rows still say "calculating"; fall back to the byte count.
+        expected=$(sed -n 's,^[Cc]ontent-[Rr]ange:.*/\([0-9][0-9]*\).*,\1,p' "$hdrfile" | tail -n 1)
+        [[ -n "$expected" ]] || \
+            expected=$(sed -n 's,^[Cc]ontent-[Ll]ength: *\([0-9][0-9]*\).*,\1,p' "$hdrfile" | tail -n 1)
+        if [[ -n "$expected" && "$expected" != "$actual" ]]; then
+            printf 'ERROR: size mismatch for %s (expected %s bytes, got %s)\n' \
+                   "$fname" "$expected" "$actual" 1>&2
+            return 1
+        fi
+        log "No MD5 published upstream; verified ${actual} bytes"
     fi
 
-
-    FILE_TYPE=$(file -i -b "${LDC_CORPUS_FILENAME}" | cut -d ';' -f 1)
-
-    if [[ "${FILE_TYPE}" == "text/html" ]]; then
-
-	log "Encountered an error downloading ${LDC_CORPUS}. The downloaded file is HTML, but was expected to be .tgz"
-	exit 1
-
+    # Most catalog filenames carry no extension; the server knows the real one.
+    if [[ "$fname" != *.* ]]; then
+        local cdname
+        cdname=$(sed -n 's,^[Cc]ontent-[Dd]isposition:.*filename="\([^"]*\)".*,\1,p' \
+                 "$hdrfile" | tail -n 1 | tr -d '\r')
+        [[ -n "$cdname" && "$cdname" == *.* ]] && final="${base}.${cdname#*.}"
     fi
 
+    rm -f "$hdrfile"
+    mv -f "$partfile" "${LDC_DOWNLOAD_DIR}/${final}"
+    log "Saved ${final}"
+}
+
+
+################################################################################
+#                                    Main                                      #
+################################################################################
+
+[[ -n "$ENV_FILE_USED" ]] && log "Using configuration from ${ENV_FILE_USED}"
+log "Download directory: ${LDC_DOWNLOAD_DIR}"
+
+ensure_catalog
+
+if [[ $# -eq 0 ]]; then
+    echo
+    echo "The corpora available to your account have been saved to ${CATALOG_FILE}"
+    echo
+    echo "To download, re-run with corpus IDs, for example:"
+    echo "    $(basename "$0") LDC96L14"
+    echo
+    exit 0
+fi
+
+# Resolve everything up front so a typo fails before any transfer starts.
+declare -A PARTS_OF=() TITLE_OF=()
+NEEDED_KIB=0
+
+for id in "$@"; do
+    mapfile -t parts < <(resolve_parts "$id")
+    [[ ${#parts[@]} -gt 0 ]] || die "$EXIT_NOTFOUND" \
+"${id} is not among the corpora available to your account (see ${CATALOG_FILE})."
+
+    title=$(corpus_title "$id")
+    [[ -n "$title" ]] || title="unknown"
+
+    TITLE_OF["$id"]="$title"
+    PARTS_OF["$id"]=$(printf '%s\n' "${parts[@]}")
+
+    pending=0 corpus_kib=0
+    for line in "${parts[@]}"; do
+        IFS=$'\t' read -r url fname md5 kib <<< "$line"
+        [[ "$md5" == "-" ]] && md5=""
+        already_have "${id}__${title}__${fname}" "$md5" > /dev/null && continue
+        pending=$(( pending + 1 ))
+        corpus_kib=$(( corpus_kib + kib ))
+    done
+
+    NEEDED_KIB=$(( NEEDED_KIB + corpus_kib ))
+    log "${id} (${title}): ${#parts[@]} part(s), ${pending} to fetch, $(gb "$corpus_kib")"
 done
 
-echo
+AVAIL_KIB=$(df -Pk "$LDC_DOWNLOAD_DIR" | awk 'NR == 2 { print $4 }')
+if [[ -n "$AVAIL_KIB" ]] && (( NEEDED_KIB > 0 )); then
+    # Keep a 1 GiB margin so a shared filesystem is never filled to the brim.
+    if (( NEEDED_KIB + 1048576 > AVAIL_KIB )); then
+        die "$EXIT_DISK" \
+"Not enough space in ${LDC_DOWNLOAD_DIR}: need $(gb "$NEEDED_KIB"), only $(gb "$AVAIL_KIB") free."
+    fi
+fi
 
+FAILED=0
+for id in "$@"; do
+    title="${TITLE_OF[$id]}"
+    while IFS=$'\t' read -r url fname md5 kib; do
+        [[ -n "$fname" ]] || continue
+        [[ "$md5" == "-" ]] && md5=""
+        base="${id}__${title}__${fname}"
+
+        if existing=$(already_have "$base" "$md5"); then
+            log "Already have $(basename "$existing"); skipping"
+            continue
+        fi
+
+        download_part "$base" "$url" "$fname" "$md5" || FAILED=$(( FAILED + 1 ))
+    done <<< "${PARTS_OF[$id]}"
+done
+
+(( FAILED == 0 )) || die "$EXIT_DOWNLOAD" "${FAILED} file(s) failed. Re-run to resume."
+log "All requested corpora are present in ${LDC_DOWNLOAD_DIR}"

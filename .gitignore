@@ -2,3 +2,8 @@ cookies.txt
 corpora.tsv
 LDC*
 *.log
+ldc.env
+.ldc.env
+*.part
+*.headers
+downloads_raw.html
